@@ -1,6 +1,7 @@
 Description: Basic VPC
 Parameters:
     ProjectTag:
+        Description: VPC Name Tag
         Default: Basic VPC
         Type: String
     VpcCIDR:
