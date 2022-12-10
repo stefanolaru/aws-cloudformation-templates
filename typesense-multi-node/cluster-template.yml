@@ -1,0 +1,422 @@
+Description: Typesense multi-node stack
+
+Parameters:
+    LatestLinuxAmiId:
+        Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+        Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2"
+    EnvironmentType:
+        Description: "Environment Type"
+        Type: String
+        Default: "dev"
+    InstanceType:
+        Description: "Instance Size"
+        Type: String
+        Default: t4g.nano
+        AllowedValues:
+            - t4g.nano
+            - t4g.micro
+            - t4g.small
+            - t4g.medium
+            - t4g.large
+            - t4g.xlarge
+            - t4g.2xlarge
+    TypesenseVersion:
+        Description: "Typesense Version"
+        Type: String
+        Default: 0.23.1
+    TypesenseApiPort:
+        Description: "Typesense API Port"
+        Type: Number
+        Default: 8108
+    TypesensePeeringPort:
+        Description: "Typesense Peering Port"
+        Type: Number
+        Default: 8107
+    TypesenseNodes:
+        Description: "Typesense Nodes Count"
+        Type: Number
+        Default: 3
+        MinValue: 3
+    TypesenseMinNodes:
+        Description: "Typesense Nodes Count"
+        Type: Number
+        Default: 3
+        MinValue: 3
+    TypesenseMaxNodes:
+        Description: "Typesense Nodes Count"
+        Type: Number
+        Default: 9
+        MinValue: 3
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: "Node Configuration"
+              Parameters:
+                  - LatestLinuxAmiId
+                  - InstanceType
+            - Label:
+                  default: "Cluster Configuration"
+              Parameters:
+                  - EnvironmentType
+                  - TypesenseVersion
+                  - TypesenseApiPort
+                  - TypesensePeeringPort
+                  - TypesenseNodes
+                  - TypesenseMinNodes
+                  - TypesenseMaxNodes
+
+Conditions:
+    IsProduction: !Equals
+        - !Ref EnvironmentType
+        - prod
+
+Resources:
+    # Launch Config
+    LaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            InstanceType: !Ref InstanceType # Graviton2 powered instances
+            ImageId: !Ref LatestLinuxAmiId
+            IamInstanceProfile: !GetAtt EC2InstanceProfile.Arn # assign cloudwatch role
+            SecurityGroups:
+                - !Ref EC2SecurityGroup
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/usr/bin/env bash
+                    # get instance private IP & ID
+                    EC2_INSTANCE_IP=$(curl -s http://instance-data/latest/meta-data/local-ipv4)
+                    EC2_INSTANCE_ID=$(curl -s http://instance-data/latest/meta-data/instance-id)
+
+                    # create typesense folders
+                    mkdir -p /opt/typesense/data
+                    mkdir -p /opt/typesense/log
+                    # create the nodes file
+                    touch /opt/typesense/nodes
+
+                    # create typesense server config file
+                    echo "[server]
+                    api-key = ${TypesenseApiKey.Value}
+                    data-dir = /opt/typesense/data
+                    log-dir = /opt/typesense/log
+                    api-port = ${TypesenseApiPort}
+                    peering-port = ${TypesensePeeringPort}
+                    peering-address = $EC2_INSTANCE_IP
+                    nodes = /opt/typesense/nodes" > /opt/typesense/typesense.ini
+
+                    # download & unarchive typesense
+                    curl -O https://dl.typesense.org/releases/${TypesenseVersion}/typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
+                    tar -xzf typesense-server-${TypesenseVersion}-linux-arm64.tar.gz -C /opt/typesense
+                    # remove archive
+                    rm typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
+
+                    # change typesense files & folders permissions
+                    chown -R ec2-user:ec2-user /opt/typesense
+
+                    # create typesense service
+                    echo "[Unit]
+                    Description=Typesense service
+                    After=network.target
+
+                    [Service]
+                    Type=simple
+                    Restart=always
+                    RestartSec=5
+                    User=ec2-user
+                    ExecStart=/opt/typesense/typesense-server --config=/opt/typesense/typesense.ini
+
+                    [Install]
+                    WantedBy=default.target" > /etc/systemd/system/typesense.service
+
+                    # start typesense service
+                    systemctl start typesense
+                    # enable typesense daemon
+                    systemctl enable typesense
+
+                    # notify sns topic of the new instance
+                    aws sns publish --message "New Instance Ready (instanceId:$EC2_INSTANCE_IP)" --topic-arn ${EC2EventsTopic}  --region ${AWS::Region}
+
+    # ASG
+    AutoScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            LaunchConfigurationName: !Ref LaunchConfig
+            DesiredCapacity: !Ref TypesenseNodes
+            MinSize: !Ref TypesenseMinNodes
+            MaxSize: !Ref TypesenseMaxNodes
+            TargetGroupARNs:
+                - !Ref ALBTargetGroup
+            VPCZoneIdentifier:
+                - !ImportValue typesense-vpc-PublicSubnet1
+                - !ImportValue typesense-vpc-PublicSubnet2
+                - !ImportValue typesense-vpc-PublicSubnet3
+            Tags:
+                - Key: Name
+                  PropagateAtLaunch: true
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
+                - Key: InstanceType
+                  PropagateAtLaunch: true
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}-node
+
+    # Instance profile
+    EC2InstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            InstanceProfileName: !Sub ${AWS::StackName}-${EnvironmentType}-instance-profile
+            Path: /
+            Roles:
+                - !Ref EC2InstanceRole
+
+    # Instance Role
+    EC2InstanceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${AWS::StackName}-${EnvironmentType}-instance-role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Path: /
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-ec2-policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Allow publishing messagest to SNS Topic
+                          - Effect: Allow
+                            Action:
+                                - sns:Publish
+                            Resource:
+                                - !Ref EC2EventsTopic
+
+    # SNS Topic to listen for instance events
+    EC2EventsTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub ${AWS::StackName}-${EnvironmentType}-ec2-events
+    # Subscribe Lambda to SNS Topic
+    EC2EventsTopicSubscription:
+        Type: AWS::SNS::Subscription
+        Properties:
+            TopicArn: !Ref EC2EventsTopic
+            Protocol: lambda
+            Endpoint: !GetAtt InstanceEventsListener.Arn
+
+    # Instance Security Group
+    EC2SecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: allow connections from ALB and SSH, from other instances within VPC
+            VpcId: !ImportValue typesense-vpc-VPCID
+            SecurityGroupIngress:
+                # Allow HTTP on Typesense port only from ALB SG
+                - IpProtocol: tcp
+                  FromPort: !Ref TypesenseApiPort
+                  ToPort: !Ref TypesenseApiPort
+                  SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+                # Allow Typesense node to communicate with each other on the peering port within the VPC IP range
+                - IpProtocol: tcp
+                  FromPort: !Ref TypesensePeeringPort
+                  ToPort: !Ref TypesensePeeringPort
+                  CidrIp: !ImportValue typesense-vpc-VPCCidrBlock # the VPC CidrIp from VPC stack
+                # Allow SSH from anywhere - just for testing - !! remove
+                # "If you need to ssh to your instance, change your deployment process"
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+
+    # ALB Security Group allowing Port 80 from anywhere
+    ALBSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: allow traffic on port 80
+            VpcId: !ImportValue typesense-vpc-VPCID
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+
+    # Load Balancer
+    ALB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Name: !Sub ${AWS::StackName}-${EnvironmentType}
+            Subnets:
+                - !ImportValue typesense-vpc-PublicSubnet1
+                - !ImportValue typesense-vpc-PublicSubnet2
+                - !ImportValue typesense-vpc-PublicSubnet3
+            SecurityGroups:
+                - !GetAtt ALBSecurityGroup.GroupId
+
+    # HTTP Listener
+    ALBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn: !Ref ALBTargetGroup
+            LoadBalancerArn: !Ref ALB
+            Port: 80
+            Protocol: HTTP
+
+    # Target Group
+    ALBTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 30
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 15
+            HealthyThresholdCount: 5
+            HealthCheckPath: /health
+            Matcher:
+                HttpCode: 200
+            Name: !Sub ${AWS::StackName}-${EnvironmentType}
+            Port: !Ref TypesenseApiPort
+            Protocol: HTTP
+            UnhealthyThresholdCount: 3
+            VpcId: !ImportValue typesense-vpc-VPCID
+
+    # Lambda Execution Role
+    LambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-lambda-policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # describe autoscaling groups
+                          - Effect: Allow
+                            Action:
+                                - autoscaling:DescribeAutoScalingGroups
+                                - autoscaling:DescribeScalingActivities
+                            Resource: "*"
+                          # describe ec2 instances
+                          - Effect: Allow
+                            Action:
+                                - ec2:DescribeInstances
+                            Resource: "*"
+                          # send SSM command
+                          - Effect: Allow
+                            Action:
+                                - ssm:SendCommand
+                            Resource: "*"
+                          # permission to write logs into CloudWatch
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: "*"
+
+    # Instance Events Listener function
+    InstanceEventsListener:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${AWS::StackName}-${EnvironmentType}-instance-listener
+            Code:
+                ZipFile: >
+                    exports.handler = (event, context) =>{
+                        console.log(event);
+                    };
+            Handler: index.handler
+            Role: !GetAtt LambdaExecutionRole.Arn
+            Environment:
+                Variables:
+                    TypesenseApiKey: !GetAtt TypesenseApiKey.Value
+                    TypesenseApiPort: !Ref TypesenseApiPort
+                    TypesensePeeringPort: !Ref TypesensePeeringPort
+                    AutoScalingGroupName: !Ref AutoScalingGroup
+                    DocumentName: !Ref UpdateNodesCommand
+            Runtime: nodejs16.x
+            MemorySize: 128
+            Timeout: 60
+
+    # SNS permission to invoke Lambda
+    LambdaInvokePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !Ref InstanceEventsListener
+            Principal: sns.amazonaws.com
+
+    # Random String Generator
+    RandomStringGenerator:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${AWS::StackName}-${EnvironmentType}-random-string
+            Code:
+                ZipFile: >
+                    const response = require("cfn-response"), crypto = require("crypto");
+                    exports.handler = (event, context) =>{
+                        response.send(event, context, response.SUCCESS, {Value:crypto.randomBytes(parseInt(event['ResourceProperties']['Length'])).toString('hex')});
+                    };
+            Handler: index.handler
+            Role: !GetAtt LambdaExecutionRole.Arn
+            Runtime: nodejs16.x
+            MemorySize: 128
+            Timeout: 10
+
+    # Typesense Admin API Key
+    TypesenseApiKey:
+        Type: AWS::CloudFormation::CustomResource
+        Properties:
+            Length: 32 # Keep in mind this is sent as String to Lambda
+            ServiceToken: !GetAtt RandomStringGenerator.Arn
+
+    # SSM Document
+    UpdateNodesCommand:
+        Type: AWS::SSM::Document
+        Properties:
+            Content:
+                schemaVersion: "2.2"
+                description: Update Typesense Nodes
+                parameters:
+                    NodeList:
+                        type: String
+                        description: Nodes string
+                mainSteps:
+                    - action: aws:runShellScript
+                      name: restartTypesense
+                      inputs:
+                          runCommand:
+                              - sudo yum update -y
+                              - echo "{{NodeList}}" > /opt/typesense/nodes
+                              - sudo systemctl restart typesense
+
+            DocumentFormat: YAML
+            DocumentType: Command
+            Name: !Sub ${AWS::StackName}-${EnvironmentType}-update-nodes
+            TargetType: /AWS::EC2::Instance
+
+Outputs:
+    ALBDnsName:
+        Value: !GetAtt ALB.DNSName
+        Description: The URL of the Load Balancer
+        Export:
+            Name: !Sub ${AWS::StackName}-ALBDnsName
+    APIKey:
+        Value: !GetAtt TypesenseApiKey.Value
+        Description: Typesense admin API Key
+        Export:
+            Name: !Sub ${AWS::StackName}-TypesenseApiKey
