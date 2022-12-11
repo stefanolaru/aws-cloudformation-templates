@@ -93,13 +93,14 @@ Resources:
                     mkdir -p /opt/typesense/data
                     mkdir -p /opt/typesense/log
                     # create the nodes file
-                    touch /opt/typesense/nodes
+                    echo "$EC2_INSTANCE_IP:${TypesensePeeringPort}:${TypesenseApiPort}" > /opt/typesense/nodes
 
                     # create typesense server config file
                     echo "[server]
                     api-key = ${TypesenseApiKey.Value}
                     data-dir = /opt/typesense/data
                     log-dir = /opt/typesense/log
+                    enable-cors = true
                     api-port = ${TypesenseApiPort}
                     peering-port = ${TypesensePeeringPort}
                     peering-address = $EC2_INSTANCE_IP
@@ -145,6 +146,11 @@ Resources:
             DesiredCapacity: !Ref TypesenseNodes
             MinSize: !Ref TypesenseMinNodes
             MaxSize: !Ref TypesenseMaxNodes
+            # notify events topic on instance termination (downsizing)
+            NotificationConfigurations:
+                - NotificationTypes:
+                      - autoscaling:EC2_INSTANCE_TERMINATE
+                  TopicARN: !Ref EC2EventsTopic
             TargetGroupARNs:
                 - !Ref ALBTargetGroup
             VPCZoneIdentifier:
@@ -227,6 +233,11 @@ Resources:
                 - IpProtocol: tcp
                   FromPort: !Ref TypesensePeeringPort
                   ToPort: !Ref TypesensePeeringPort
+                  CidrIp: !ImportValue typesense-vpc-VPCCidrBlock # the VPC CidrIp from VPC stack
+                # Allow Typesense node to communicate with each other on the api port within the VPC IP range for status checks
+                - IpProtocol: tcp
+                  FromPort: !Ref TypesenseApiPort
+                  ToPort: !Ref TypesenseApiPort
                   CidrIp: !ImportValue typesense-vpc-VPCCidrBlock # the VPC CidrIp from VPC stack
                 # Allow SSH from anywhere - just for testing - !! remove
                 # "If you need to ssh to your instance, change your deployment process"
@@ -335,10 +346,8 @@ Resources:
         Properties:
             FunctionName: !Sub ${AWS::StackName}-${EnvironmentType}-instance-listener
             Code:
-                ZipFile: >
-                    exports.handler = (event, context) =>{
-                        console.log(event);
-                    };
+                S3Bucket: !ImportValue typesense-vpc-LambdaZipsBucket
+                S3Key: instance-listener.zip
             Handler: index.handler
             Role: !GetAtt LambdaExecutionRole.Arn
             Environment:

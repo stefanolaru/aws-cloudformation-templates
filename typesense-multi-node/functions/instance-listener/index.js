@@ -11,7 +11,7 @@ exports.handler = async () => {
         })
         .promise()
         .then((res) =>
-            res.AutoScalingGroups[0]
+            res.AutoScalingGroups[0] && res.AutoScalingGroups[0].Instances
                 ? selectInstances(res.AutoScalingGroups[0].Instances)
                 : []
         )
@@ -19,12 +19,14 @@ exports.handler = async () => {
             console.log(err);
         });
 
+    // stop early if less than 3 nodes
+    if (!instances || instances.length < 3) return;
+
     // extract instance IDs
     const instanceIds = instances.map((x) => x.InstanceId),
-        nodes = [],
         nodeStrings = [];
 
-    // describe instances
+    // describe instances to extract private IPs
     await ec2
         .describeInstances({
             InstanceIds: instanceIds,
@@ -47,7 +49,7 @@ exports.handler = async () => {
             console.log(err);
         });
 
-    // send SSM Command
+    // send SSM Command to update nodes & restart service
     await ssm
         .sendCommand({
             DocumentName: process.env.DocumentName,
@@ -65,7 +67,7 @@ exports.handler = async () => {
             console.log(err);
         });
 
-    console.log(nodes);
+    //
     console.log(nodeStrings.join(","));
 
     return nodeStrings.join(",");

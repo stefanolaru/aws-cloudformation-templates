@@ -131,6 +131,10 @@ Resources:
             RouteTableId: !Ref PublicRouteTable
             SubnetId: !Ref PublicSubnet3
 
+    # Lambda ZIP Storage
+    LambdaZipsBucket:
+        Type: AWS::S3::Bucket
+
 Outputs:
     VPC:
         Description: The ID of the VPC
@@ -157,3 +161,8 @@ Outputs:
         Value: !Ref PublicSubnet3
         Export:
             Name: !Sub ${AWS::StackName}-PublicSubnet3
+    LambdaZipsBucket:
+        Description: Lambda ZIPs Bucket
+        Value: !Ref LambdaZipsBucket
+        Export:
+            Name: !Sub ${AWS::StackName}-LambdaZipsBucket
