@@ -40,21 +40,10 @@ Parameters:
         Description: "Storage Volume Mount Path"
         Type: String
         Default: "/mnt/ebs"
-    VpcId:
-        Description: "VPC Id"
-        Type: "AWS::EC2::VPC::Id"
-    Subnets:
-        Description: "Subnets"
-        Type: "List<AWS::EC2::Subnet::Id>"
 
 Metadata:
     AWS::CloudFormation::Interface:
         ParameterGroups:
-            - Label:
-                  default: "Network Configuration"
-              Parameters:
-                  - VpcId
-                  - Subnets
             - Label:
                   default: "Storage Configuration"
               Parameters:
@@ -65,6 +54,7 @@ Metadata:
                   default: "Typesense Configuration"
               Parameters:
                   - EnvironmentType
+                  - LatestLinuxAmiId
                   - InstanceType
                   - TypesenseVersion
                   - TypesenseApiPort
@@ -84,6 +74,9 @@ Resources:
                     #!/usr/bin/env bash
                     # get instance-id
                     EC2_INSTANCE_ID=$(curl -s http://instance-data/latest/meta-data/instance-id)
+
+                    # associate the Elastic IP address to the instance
+                    aws ec2 associate-address --instance-id $EC2_INSTANCE_ID --allocation-id ${ElasticIP.AllocationId} --allow-reassociation  --region ${AWS::Region}
 
                     # attach volume
                     aws ec2 attach-volume --device ${VolumeDevice} --instance-id $EC2_INSTANCE_ID --volume-id ${EBSVolume} --region ${AWS::Region}
@@ -171,10 +164,8 @@ Resources:
         Properties:
             LaunchConfigurationName: !Ref LaunchConfig
             DesiredCapacity: 1
-            MinSize: 1
+            MinSize: 0
             MaxSize: 1
-            TargetGroupARNs:
-                - !Ref ALBTargetGroup
             # make sure the instances are launched in the same AZ as the EBS volume
             AvailabilityZones:
                 - !Select [0, !GetAZs ""]
@@ -221,6 +212,11 @@ Resources:
                                 - ec2:AttachVolume
                                 - ec2:DetachVolume
                             Resource: "*"
+                          # allow Elastic IP association
+                          - Effect: Allow
+                            Action:
+                                - ec2:AssociateAddress
+                            Resource: "*"
     # EBS Volume
     EBSVolume:
         Type: AWS::EC2::Volume
@@ -238,66 +234,52 @@ Resources:
     EC2SecurityGroup:
         Type: AWS::EC2::SecurityGroup
         Properties:
-            GroupDescription: allow connections from
+            GroupDescription: allow connections on HTTP & SSH
             SecurityGroupIngress:
-                # Allow HTTP on Typesense port only from ALB SG
+                # Allow HTTP traffic on Typesense port
                 - IpProtocol: tcp
                   FromPort: !Ref TypesensePort
                   ToPort: !Ref TypesensePort
-                  SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+                  CidrIp: 0.0.0.0/0
                 # Allow SSH from anywhere - too open, narrow down the IPs or remove entirely
                 - IpProtocol: tcp
                   FromPort: 22
                   ToPort: 22
                   CidrIp: 0.0.0.0/0
 
-    # ALB Security Group allowing Port 80 from anywhere
-    ALBSecurityGroup:
-        Type: AWS::EC2::SecurityGroup
+    # Elastic IP
+    ElasticIP:
+        Type: AWS::EC2::EIP
         Properties:
-            GroupDescription: allow traffic on port 80
-            SecurityGroupIngress:
-                - IpProtocol: tcp
-                  FromPort: 80
-                  ToPort: 80
-                  CidrIp: 0.0.0.0/0
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
 
-    # Load Balancer
-    ALB:
-        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    # Lambda Execution Role
+    LambdaExecutionRole:
+        Type: AWS::IAM::Role
         Properties:
-            Name: !Sub ${AWS::StackName}-${EnvironmentType}
-            Subnets: !Ref Subnets
-            SecurityGroups:
-                - !GetAtt ALBSecurityGroup.GroupId
-
-    # HTTP Listener
-    ALBListener:
-        Type: AWS::ElasticLoadBalancingV2::Listener
-        Properties:
-            DefaultActions:
-                - Type: forward
-                  TargetGroupArn: !Ref ALBTargetGroup
-            LoadBalancerArn: !Ref ALB
-            Port: 80
-            Protocol: HTTP
-
-    # Target Group
-    ALBTargetGroup:
-        Type: AWS::ElasticLoadBalancingV2::TargetGroup
-        Properties:
-            HealthCheckIntervalSeconds: 30
-            HealthCheckProtocol: HTTP
-            HealthCheckTimeoutSeconds: 15
-            HealthyThresholdCount: 5
-            HealthCheckPath: /health
-            Matcher:
-                HttpCode: 200
-            Name: !Sub ${AWS::StackName}-${EnvironmentType}
-            Port: !Ref TypesensePort
-            Protocol: HTTP
-            UnhealthyThresholdCount: 3
-            VpcId: !Ref VpcId
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-lambda-policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # permission to write logs into CloudWatch
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: "*"
 
     # Random String Generator
     RandomStringGenerator:
@@ -324,11 +306,11 @@ Resources:
             ServiceToken: !GetAtt RandomStringGenerator.Arn
 
 Outputs:
-    ALBDnsName:
-        Value: !GetAtt ALB.DNSName
-        Description: The URL of the Load Balancer
+    EIP:
+        Value: !Ref ElasticIP
+        Description: The Elastic IP associated to the instance
         Export:
-            Name: !Sub ${AWS::StackName}-ALBDnsName
+            Name: !Sub ${AWS::StackName}-EIP
     APIKey:
         Value: !GetAtt TypesenseApiKey.Value
         Description: Typesense admin API Key
