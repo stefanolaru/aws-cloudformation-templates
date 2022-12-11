@@ -4,10 +4,10 @@ Parameters:
     LatestLinuxAmiId:
         Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
         Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2"
-    InstanceSize:
+    InstanceType:
         Description: "Instance Size"
         Type: String
-        Default: t4g.small
+        Default: t4g.micro
         AllowedValues:
             - t4g.nano
             - t4g.micro
@@ -20,10 +20,10 @@ Parameters:
         Description: "Environment Type"
         Type: String
         Default: "dev"
-    TypesenseApiKey:
-        Description: "Typesense Admin API Key"
+    TypesenseVersion:
+        Description: "Typesense Version"
         Type: String
-        MinLength: 16
+        Default: 0.23.1
     TypesensePort:
         Description: "Typesense Port"
         Type: Number
@@ -47,17 +47,34 @@ Parameters:
         Description: "Subnets"
         Type: "List<AWS::EC2::Subnet::Id>"
 
-Conditions:
-    IsProduction: !Equals
-        - !Ref EnvironmentType
-        - prod
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: "Network Configuration"
+              Parameters:
+                  - VpcId
+                  - Subnets
+            - Label:
+                  default: "Storage Configuration"
+              Parameters:
+                  - VolumeSize
+                  - VolumeDevice
+                  - VolumeMountPath
+            - Label:
+                  default: "Typesense Configuration"
+              Parameters:
+                  - EnvironmentType
+                  - InstanceType
+                  - TypesenseVersion
+                  - TypesenseApiPort
 
 Resources:
     # Launch Config
     LaunchConfig:
         Type: AWS::AutoScaling::LaunchConfiguration
         Properties:
-            InstanceType: !Ref InstanceSize # Graviton2 powered instances
+            InstanceType: !Ref InstanceType # Graviton2 powered instances
             ImageId: !Ref LatestLinuxAmiId
             IamInstanceProfile: !GetAtt EC2InstanceProfile.Arn # assign cloudwatch role
             SecurityGroups:
@@ -101,7 +118,7 @@ Resources:
                     if [ ! -f ${VolumeMountPath}/typesense.ini ]
                     then
                         echo "[server]
-                    api-key = ${TypesenseApiKey}
+                    api-key = ${TypesenseApiKey.Value}
                     data-dir = ${VolumeMountPath}/data
                     log-dir = ${VolumeMountPath}/log
                     api-port = ${TypesensePort}" > ${VolumeMountPath}/typesense.ini
@@ -123,10 +140,10 @@ Resources:
                     fi
 
                     # download & unarchive typesense
-                    curl -O https://dl.typesense.org/releases/0.23.1/typesense-server-0.23.1-linux-arm64.tar.gz
-                    tar -xzf typesense-server-0.23.1-linux-arm64.tar.gz -C /home/ec2-user
+                    curl -O https://dl.typesense.org/releases/${TypesenseVersion}/typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
+                    tar -xzf typesense-server-${TypesenseVersion}-linux-arm64.tar.gz -C /home/ec2-user
                     # remove archive
-                    rm typesense-server-0.23.1-linux-arm64.tar.gz
+                    rm typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
 
                     # create typesense service
                     echo "[Unit]
@@ -282,9 +299,38 @@ Resources:
             UnhealthyThresholdCount: 3
             VpcId: !Ref VpcId
 
+    # Random String Generator
+    RandomStringGenerator:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${AWS::StackName}-${EnvironmentType}-random-string
+            Code:
+                ZipFile: >
+                    const response = require("cfn-response"), crypto = require("crypto");
+                    exports.handler = (event, context) =>{
+                        response.send(event, context, response.SUCCESS, {Value:crypto.randomBytes(parseInt(event['ResourceProperties']['Length'])).toString('hex')});
+                    };
+            Handler: index.handler
+            Role: !GetAtt LambdaExecutionRole.Arn
+            Runtime: nodejs16.x
+            MemorySize: 128
+            Timeout: 10
+
+    # Typesense Admin API Key
+    TypesenseApiKey:
+        Type: AWS::CloudFormation::CustomResource
+        Properties:
+            Length: 32 # Keep in mind this is sent as String to Lambda
+            ServiceToken: !GetAtt RandomStringGenerator.Arn
+
 Outputs:
     ALBDnsName:
         Value: !GetAtt ALB.DNSName
         Description: The URL of the Load Balancer
         Export:
             Name: !Sub ${AWS::StackName}-ALBDnsName
+    APIKey:
+        Value: !GetAtt TypesenseApiKey.Value
+        Description: Typesense admin API Key
+        Export:
+            Name: !Sub ${AWS::StackName}-TypesenseApiKey
