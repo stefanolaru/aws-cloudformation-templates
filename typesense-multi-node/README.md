@@ -21,3 +21,4 @@ Although this stack is made for Typesense specifically it can be repurposed easi
 -   Deploy Lambda function with zipped code
 -   SNS & Lambda working with SDK
 -   Systems Manager document & run command
+-   CloudWatch agent & config

@@ -85,6 +85,9 @@ Resources:
             UserData:
                 Fn::Base64: !Sub |
                     #!/usr/bin/env bash
+                    # install cloudwatch agent
+                    yum -y install amazon-cloudwatch-agent
+
                     # get instance private IP & ID
                     EC2_INSTANCE_IP=$(curl -s http://instance-data/latest/meta-data/local-ipv4)
                     EC2_INSTANCE_ID=$(curl -s http://instance-data/latest/meta-data/instance-id)
@@ -134,6 +137,9 @@ Resources:
                     systemctl start typesense
                     # enable typesense daemon
                     systemctl enable typesense
+
+                    # auto configure cloudwatch agent
+                    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${CloudWatchAgentConfig} -s
 
                     # notify sns topic of the new instance
                     aws sns publish --message "New Instance Ready (instanceId:$EC2_INSTANCE_IP)" --topic-arn ${EC2EventsTopic}  --region ${AWS::Region}
@@ -209,6 +215,23 @@ Resources:
         Type: AWS::SNS::Topic
         Properties:
             TopicName: !Sub ${AWS::StackName}-${EnvironmentType}-ec2-events
+
+    # SNS Topic Policy allow any service under account to trigger this - too broad maybe?
+    EC2EventsTopicPolicy:
+        Type: AWS::SNS::TopicPolicy
+        Properties:
+            Topics:
+                - !Ref EC2EventsTopic
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action: sns:Publish
+                      Resource: !Ref EC2EventsTopic
+                      Principal:
+                          Service:
+                              - autoscaling.amazonaws.com
+
     # Subscribe Lambda to SNS Topic
     EC2EventsTopicSubscription:
         Type: AWS::SNS::Subscription
@@ -417,6 +440,59 @@ Resources:
             DocumentType: Command
             Name: !Sub ${AWS::StackName}-${EnvironmentType}-update-nodes
             TargetType: /AWS::EC2::Instance
+
+    # SSM CloudWatch agent config
+    CloudWatchAgentConfig:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: AmazonCloudWatchConfig
+            Type: String
+            Value: |
+                {
+                    "agent": {
+                        "metrics_collection_interval": 60,
+                        "run_as_user": "root"
+                    },
+                    "logs": {
+                        "logs_collected": {
+                            "files": {
+                                "collect_list": [
+                                    {
+                                        "file_path": "/opt/typesense/log/typesense.log",
+                                        "log_group_name": "typesense.log",
+                                        "log_stream_name": "{instance_id}",
+                                        "retention_in_days": 7
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "metrics": {
+                        "aggregation_dimensions": [["InstanceId"]],
+                        "append_dimensions": {
+                            "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+                            "ImageId": "${aws:ImageId}",
+                            "InstanceId": "${aws:InstanceId}",
+                            "InstanceType": "${aws:InstanceType}"
+                        },
+                        "metrics_collected": {
+                            "disk": {
+                                "measurement": ["used_percent"],
+                                "metrics_collection_interval": 60,
+                                "resources": ["*"]
+                            },
+                            "mem": {
+                                "measurement": ["mem_used_percent"],
+                                "metrics_collection_interval": 60
+                            },
+                            "statsd": {
+                                "metrics_aggregation_interval": 60,
+                                "metrics_collection_interval": 10,
+                                "service_address": ":8125"
+                            }
+                        }
+                    }
+                }
 
 Outputs:
     ALBDnsName:
