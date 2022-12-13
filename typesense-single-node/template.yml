@@ -122,14 +122,14 @@ Resources:
                     if [ ! -d ${VolumeMountPath}/data ]
                     then
                         mkdir -p ${VolumeMountPath}/data
-                        chown -R ec2-user:ec2-user ${VolumeMountPath}/data
+                        chown ec2-user:ec2-user ${VolumeMountPath}/data
                     fi
 
                     # create typesense logs folder if not exists
                     if [ ! -d ${VolumeMountPath}/log ]
                     then
                         mkdir -p ${VolumeMountPath}/log
-                        chown -R ec2-user:ec2-user ${VolumeMountPath}/log
+                        chown ec2-user:ec2-user ${VolumeMountPath}/log
                     fi
 
                     # download & unarchive typesense
@@ -198,9 +198,6 @@ Resources:
                       Action:
                           - sts:AssumeRole
             Path: /
-            ManagedPolicyArns:
-                - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
-                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
             Policies:
                 - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-instance-policy
                   PolicyDocument:
