@@ -1,0 +1,385 @@
+Description: LAMP stack
+Transform: AWS::LanguageExtensions
+
+Parameters:
+    NetworkStack:
+        Description: "Network stack name"
+        Type: String
+    EC2InstanceAmi:
+        Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+        Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2"
+        Description: "AWS AMI Id"
+    EC2InstanceType:
+        Description: "EC2 Instance Size"
+        Type: String
+        Default: t4g.micro
+        AllowedValues:
+            - t4g.nano
+            - t4g.micro
+            - t4g.small
+            - t4g.medium
+            - t4g.large
+            - t4g.xlarge
+            - t4g.2xlarge
+    RDSInstanceType:
+        Description: "DB Instance Size"
+        Type: String
+        Default: db.t4g.micro
+        AllowedValues:
+            - db.t4g.micro
+            - db.t4g.small
+            - db.t4g.medium
+            - db.t4g.large
+            - db.t4g.xlarge
+            - db.t4g.2xlarge
+    EnvironmentType:
+        Description: "Environment Type"
+        Type: String
+        Default: dev
+        AllowedValues:
+            - prod
+            - staging
+            - dev
+    WebserverVolumeSize:
+        Description: "Webserver Config Storage Volume Size (GB)"
+        Type: Number
+        Default: 8
+    WebserverVolumeDevice:
+        Description: "Webserver Config Storage Volume Device"
+        Type: String
+        Default: /dev/sdf
+    WebserverVolumeMountPath:
+        Description: "Webserver Config Storage Volume Mount Path"
+        Type: String
+        Default: /mnt/ebs
+    WebrootVolumeSize:
+        Description: "Webroot Storage Volume Size (GB)"
+        Type: Number
+        Default: 80
+    WebrootVolumeDevice:
+        Description: "Webroot Storage Volume Device"
+        Type: String
+        Default: "/dev/sdi"
+    WebrootVolumeMountPath:
+        Description: "Webroot Storage Volume Mount Path"
+        Type: String
+        Default: "/var/www/vhosts"
+    RDSName:
+        Description: "DB name"
+        Type: String
+    RDSUsername:
+        Description: "DB admin username"
+        Type: String
+        Default: admin
+    RDSMultiAZ:
+        Description: "Enable Multi AZ"
+        Type: String
+        Default: false
+        AllowedValues:
+            - true
+            - false
+
+Conditions:
+    IsProduction: !Equals
+        - !Ref EnvironmentType
+        - prod
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            - Label:
+                  default: "Global Configuration"
+              Parameters:
+                  - NetworkStack
+                  - EnvironmentType
+            - Label:
+                  default: "EC2 Configuration"
+              Parameters:
+                  - EC2InstanceAmi
+                  - EC2InstanceType
+            - Label:
+                  default: "RDS Configuration"
+              Parameters:
+                  - RDSInstanceType
+                  - RDSName
+                  - RDSUsername
+                  - RDSMultiAZ
+            - Label:
+                  default: "Storage Configuration"
+              Parameters:
+                  - WebserverVolumeSize
+                  - WebserverVolumeDevice
+                  - WebserverVolumeMountPath
+                  - WebrootVolumeSize
+                  - WebrootVolumeDevice
+                  - WebrootVolumeMountPath
+
+Resources:
+    # Launch Config
+    LaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            InstanceType: !Ref EC2InstanceType # Graviton2 powered instances
+            ImageId: !Ref EC2InstanceAmi
+            IamInstanceProfile: !GetAtt EC2InstanceProfile.Arn # assign cloudwatch role
+            SecurityGroups:
+                - !Ref EC2SecurityGroup
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/usr/bin/env bash
+                    # get instance-id
+                    EC2_INSTANCE_ID=$(curl -s http://instance-data/latest/meta-data/instance-id)
+
+                    # associate the Elastic IP address to the instance
+                    aws ec2 associate-address --instance-id $EC2_INSTANCE_ID --allocation-id ${ElasticIP.AllocationId} --allow-reassociation  --region ${AWS::Region}
+
+                    # attach volumes to instance
+                    aws ec2 attach-volume --device ${WebserverVolumeDevice} --instance-id $EC2_INSTANCE_ID --volume-id ${WebserverVolume} --region ${AWS::Region}
+                    aws ec2 attach-volume --device ${WebrootVolumeDevice} --instance-id $EC2_INSTANCE_ID --volume-id ${WebrootVolume} --region ${AWS::Region}
+
+                    # wait for webserver volume to be properly attached
+                    DATA_STATE="unknown"
+                    until [ "${!DATA_STATE}" == "attached" ]; do
+                        DATA_STATE=$(aws ec2 describe-volumes \
+                            --region ${AWS::Region} \
+                            --filters \
+                                Name=attachment.instance-id,Values=${!EC2_INSTANCE_ID} \
+                                Name=attachment.device,Values=${WebserverVolumeDevice} \
+                            --query Volumes[].Attachments[].State \
+                            --output text)
+
+                        sleep 5
+                    done
+
+                    # wait for webroot volume to be properly attached
+                    DATA_STATE="unknown"
+                    until [ "${!DATA_STATE}" == "attached" ]; do
+                        DATA_STATE=$(aws ec2 describe-volumes \
+                            --region ${AWS::Region} \
+                            --filters \
+                                Name=attachment.instance-id,Values=${!EC2_INSTANCE_ID} \
+                                Name=attachment.device,Values=${WebrootVolumeDevice} \
+                            --query Volumes[].Attachments[].State \
+                            --output text)
+
+                        sleep 5
+                    done
+
+                    # format the volumes if no file system
+                    blkid --match-token TYPE=ext4 ${WebserverVolumeDevice} || mkfs.ext4 -m0 ${WebserverVolumeDevice}
+                    blkid --match-token TYPE=ext4 ${WebrootVolumeDevice} || mkfs.ext4 -m0 ${WebrootVolumeDevice}
+
+                    # create mounting paths
+                    mkdir -p ${WebserverVolumeMountPath}
+                    mkdir -p ${WebrootVolumeMountPath}
+
+                    # mount the volumes to paths
+                    mount ${WebserverVolumeDevice} ${WebserverVolumeMountPath}
+                    mount ${WebrootVolumeDevice} ${WebrootVolumeMountPath}
+
+                    # persist the volume on restart
+                    echo "${WebserverVolumeDevice} ${WebserverVolumeMountPath} ext4 defaults,nofail 0 2
+                    ${WebrootVolumeDevice} ${WebrootVolumeMountPath} ext4 defaults,nofail 0 2" >> /etc/fstab
+
+    # ASG
+    AutoScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            LaunchConfigurationName: !Ref LaunchConfig
+            DesiredCapacity: 1
+            MinSize: 0
+            MaxSize: 1
+            VPCZoneIdentifier:
+                - Fn::ImportValue: !Sub ${NetworkStack}-PublicSubnet1
+            Tags:
+                - Key: Name
+                  PropagateAtLaunch: true
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
+
+    # Elastic IP
+    ElasticIP:
+        Type: AWS::EC2::EIP
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
+        DeletionPolicy: !If
+            - IsProduction
+            - Retain
+            - Delete
+
+    # Security Group
+    EC2SecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: allow connections from HTTP, HTTPS and SSH
+            VpcId:
+                Fn::ImportValue: !Sub ${NetworkStack}-VPCID
+            SecurityGroupIngress:
+                # HTTP call http server
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+                # HTTPS call http server
+                - IpProtocol: tcp
+                  FromPort: 443
+                  ToPort: 443
+                  CidrIp: 0.0.0.0/0
+                # SSH
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType} SG
+
+    # EC2 instance profile
+    EC2InstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: /
+            Roles:
+                - !Ref EC2Role
+
+    # EC2 role for CW (and more)
+    EC2Role:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}-${EnvironmentType}
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy # for cloudwatch agent
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-ec2-policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # allow attaching EBS volumes
+                          - Effect: Allow
+                            Action:
+                                - ec2:AttachVolume
+                                - ec2:DetachVolume
+                            Resource: "*"
+                          # allow Elastic IP association
+                          - Effect: Allow
+                            Action:
+                                - ec2:AssociateAddress
+                            Resource: "*"
+
+    # DB User & Pass
+    RDSAdmin:
+        Type: AWS::SecretsManager::Secret
+        Properties:
+            Description: AWS RDS admin credentials
+            GenerateSecretString:
+                SecretStringTemplate: !Sub '{"username": "${RDSUsername}"}'
+                GenerateStringKey: password
+                PasswordLength: 32
+                ExcludeCharacters: '"@/\'
+
+    # DB Subnet Group
+    RDSSubnetGroup:
+        Type: AWS::RDS::DBSubnetGroup
+        Properties:
+            DBSubnetGroupDescription: !Sub ${AWS::StackName}-${EnvironmentType} DB Subnet Group
+            DBSubnetGroupName: !Sub ${AWS::StackName}-${EnvironmentType}
+            SubnetIds:
+                - Fn::ImportValue: !Sub ${NetworkStack}-PrivateSubnet1
+                - Fn::ImportValue: !Sub ${NetworkStack}-PrivateSubnet2
+
+    # DB Security Group
+    RDSSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId:
+                Fn::ImportValue: !Sub ${NetworkStack}-VPCID
+            GroupName: !Sub ${AWS::StackName}-${EnvironmentType} - RDS
+            GroupDescription: Allow DB access for webserver only
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 3306
+                  ToPort: 3306
+                  SourceSecurityGroupId: !GetAtt EC2SecurityGroup.GroupId
+
+    # DB
+    RDSInstance:
+        Type: AWS::RDS::DBInstance
+        Properties:
+            DBName: !Ref RDSName
+            DBInstanceClass: !Ref RDSInstanceType
+            DBInstanceIdentifier: !Sub ${AWS::StackName}-${EnvironmentType}
+            DBSubnetGroupName: !Ref RDSSubnetGroup
+            AllocatedStorage: 20
+            Engine: mariadb
+            MasterUsername: !Sub "{{resolve:secretsmanager:${RDSAdmin}::username}}"
+            MasterUserPassword: !Sub "{{resolve:secretsmanager:${RDSAdmin}::password}}"
+            MultiAZ: true
+            VPCSecurityGroups:
+                - !GetAtt RDSSecurityGroup.GroupId
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
+        DeletionPolicy: !If
+            - IsProduction
+            - Retain
+            - Delete
+
+    # attach secrets manager to DB instance
+    RDSSecretAttachment:
+        Type: AWS::SecretsManager::SecretTargetAttachment
+        Properties:
+            SecretId: !Ref RDSAdmin
+            TargetId: !Ref RDSInstance
+            TargetType: AWS::RDS::DBInstance
+
+    # Webserver EBS Volume
+    WebserverVolume:
+        Type: AWS::EC2::Volume
+        Properties:
+            Size: !Ref WebserverVolumeSize
+            # make sure the instances are in the same AZ as the EBS volume
+            AvailabilityZone: !Select [0, !GetAZs ""]
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType} Webserver
+        DeletionPolicy: !If
+            - IsProduction
+            - Retain
+            - Delete
+
+    # Webroot EBS Volume
+    WebrootVolume:
+        Type: AWS::EC2::Volume
+        Properties:
+            Size: !Ref WebrootVolumeSize
+            # make sure the instances are in the same AZ as the EBS volume
+            AvailabilityZone: !Select [0, !GetAZs ""]
+            Tags:
+                - Key: Name
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType} Webroot
+        DeletionPolicy: !If
+            - IsProduction
+            - Retain
+            - Delete
+
+Outputs:
+    EIP:
+        Value: !Ref ElasticIP
+        Description: The Elastic IP associated to the instance
+        Export:
+            Name: !Sub ${AWS::StackName}-EIP
+    DBHostEndpoint:
+        Value: !GetAtt RDSInstance.Endpoint.Address
+        Description: The host endpoint of the RDS Instance
+        Export:
+            Name: !Sub ${AWS::StackName}-DB-HOST
