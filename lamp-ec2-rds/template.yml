@@ -64,9 +64,6 @@ Parameters:
         Description: "Webroot Storage Volume Mount Path"
         Type: String
         Default: "/var/www/vhosts"
-    RDSName:
-        Description: "DB name"
-        Type: String
     RDSUsername:
         Description: "DB admin username"
         Type: String
@@ -315,10 +312,13 @@ Resources:
     RDSInstance:
         Type: AWS::RDS::DBInstance
         Properties:
-            DBName: !Ref RDSName
             DBInstanceClass: !Ref RDSInstanceType
             DBInstanceIdentifier: !Sub ${AWS::StackName}-${EnvironmentType}
             DBSubnetGroupName: !Ref RDSSubnetGroup
+            DeletionProtection: !If
+                - IsProduction
+                - true
+                - false
             AllocatedStorage: 20
             Engine: mariadb
             MasterUsername: !Sub "{{resolve:secretsmanager:${RDSAdmin}::username}}"
