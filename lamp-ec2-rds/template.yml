@@ -256,6 +256,7 @@ Resources:
                       Action: sts:AssumeRole
             ManagedPolicyArns:
                 - arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy # for cloudwatch agent
+                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
             Policies:
                 - PolicyName: !Sub ${AWS::StackName}-${EnvironmentType}-ec2-policy
                   PolicyDocument:
@@ -266,6 +267,7 @@ Resources:
                             Action:
                                 - ec2:AttachVolume
                                 - ec2:DetachVolume
+                                - ec2:DescribeVolumes
                             Resource: "*"
                           # allow Elastic IP association
                           - Effect: Allow
