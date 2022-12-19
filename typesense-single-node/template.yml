@@ -208,6 +208,7 @@ Resources:
                             Action:
                                 - ec2:AttachVolume
                                 - ec2:DetachVolume
+                                - ec2:DescribeVolumes
                             Resource: "*"
                           # allow Elastic IP association
                           - Effect: Allow
