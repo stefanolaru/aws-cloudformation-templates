@@ -1,0 +1,178 @@
+Description: API Gateway -> SQS
+
+Parameters:
+    QueueName:
+        Description: Name of the SQS queue
+        Type: String
+        Default: api-gateway-sqs-queue
+    StageName:
+        Description: Name of the API Gateway stage
+        Type: String
+        Default: dev
+
+Resources:
+    # SQS queue
+    Queue:
+        Type: AWS::SQS::Queue
+        Properties:
+            QueueName: !Sub ${QueueName}-${StageName}.fifo
+            FifoQueue: true
+            ContentBasedDeduplication: true
+            RedrivePolicy:
+                deadLetterTargetArn: !GetAtt QueueDLQ.Arn
+                maxReceiveCount: 5
+    # SQS queue DLQ
+    QueueDLQ:
+        Type: AWS::SQS::Queue
+        Properties:
+            QueueName: !Sub ${QueueName}-${StageName}-dlq.fifo
+            FifoQueue: true
+
+    # events api gateway
+    APIGateway:
+        Type: AWS::ApiGateway::RestApi
+        # rest api gateway properties
+        Properties:
+            Name: !Ref AWS::StackName
+            Description: !Sub ${AWS::StackName} API Gateway
+            EndpointConfiguration:
+                Types:
+                    - REGIONAL
+            Body:
+                openapi: 3.0.1
+                info:
+                    title: API Gateway -> SQS
+                paths:
+                    /events:
+                        post:
+                            description: Send events to SQS
+                            operationId: sendEvent
+                            requestBody:
+                                content:
+                                    application/json:
+                                        schema:
+                                            $ref: "#/components/schemas/event"
+                            responses:
+                                "200":
+                                    description: Successful request
+                                "400":
+                                    description: Bad request
+                                "500":
+                                    description: Server Error
+                            x-amazon-apigateway-request-validator: "Validate body"
+                            x-amazon-apigateway-integration:
+                                httpMethod: POST
+                                type: aws
+                                passthroughBehavior: never
+                                credentials: !GetAtt AGW2SQSRole.Arn
+                                uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${Queue.QueueName}
+                                requestParameters:
+                                    integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                                requestTemplates:
+                                    application/json: |
+                                        #set($MsgDedupId = $context.requestId)
+                                        #set($GroupId = $input.json('$.data.event_type'))
+                                        Action=SendMessage&MessageGroupId=$GroupId&MessageDeduplicationId=$MsgDedupId&MessageBody=$input.body
+                                responses:
+                                    default:
+                                        statusCode: 200
+                                        responseTemplates:
+                                            application/json: |
+                                                #set($output = $input.path('$'))
+                                                {
+                                                  "id": "$output.SendMessageResponse.SendMessageResult.MessageId"
+                                                }
+                                    "400":
+                                        statusCode: 400
+                                        responseTemplates:
+                                            application/json: |
+                                                {
+                                                    "error": "Bad request body"
+                                                }
+                                    "500":
+                                        statusCode: 500
+                                        responseTemplates:
+                                            application/json: |
+                                                {
+                                                    "error": $context
+                                                }
+                components:
+                    schemas:
+                        event:
+                            required:
+                                - event
+                                - timestamp
+                            type: object
+                            properties:
+                                event:
+                                    type: string
+                                    example: opened
+                                    enum:
+                                        - accepted
+                                        - opened
+                                        - clicked
+                                        - failed
+                                        - rejected
+                                        - unsubscribed
+                                        - complained
+                                timestamp:
+                                    type: string
+                                    format: date-time
+                                    example: "2023-01-01T23:00:00Z"
+    # create api gateway stage
+    AGWStage:
+        Type: AWS::ApiGateway::Stage
+        Properties:
+            StageName: !Ref StageName
+            RestApiId: !Ref APIGateway
+            Description: API Gateway Stage
+            DeploymentId: !Ref AGWDeployment
+            MethodSettings:
+                - DataTraceEnabled: true
+                  MetricsEnabled: true
+                  HttpMethod: "*"
+                  LoggingLevel: INFO
+                  ResourcePath: /*
+    # create api gateway deployment
+    AGWDeployment:
+        Type: AWS::ApiGateway::Deployment
+        DependsOn: APIGateway
+        Properties:
+            RestApiId: !Ref APIGateway
+            Description: Events API Gateway Deployment
+    # role allowing AGW to send messages to SQS queue
+    AGW2SQSRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}-agw2sqs
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - apigateway.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}-agw2sqs
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # allow AGW to send messages to SQS queue
+                          - Effect: Allow
+                            Action:
+                                - sqs:SendMessage
+                            Resource: !GetAtt Queue.Arn
+                          # let AGW write to CloudWatch
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: "*"
+
+Outputs:
+    APIGatewayURL:
+        Description: URL for API Gateway
+        Value: !Sub https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/events
