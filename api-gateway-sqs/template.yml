@@ -52,6 +52,9 @@ Resources:
                                     application/json:
                                         schema:
                                             $ref: "#/components/schemas/event"
+                            # enable request validator
+                            x-amazon-apigateway-request-validator: basic
+                            # define request response
                             responses:
                                 "200":
                                     description: Successful request
@@ -59,7 +62,7 @@ Resources:
                                     description: Bad request
                                 "500":
                                     description: Server Error
-                            x-amazon-apigateway-request-validator: "Validate body"
+                            # enable api gateway integration
                             x-amazon-apigateway-integration:
                                 httpMethod: POST
                                 type: aws
@@ -82,25 +85,12 @@ Resources:
                                                 {
                                                   "id": "$output.SendMessageResponse.SendMessageResult.MessageId"
                                                 }
-                                    "400":
-                                        statusCode: 400
-                                        responseTemplates:
-                                            application/json: |
-                                                {
-                                                    "error": "Bad request body"
-                                                }
-                                    "500":
-                                        statusCode: 500
-                                        responseTemplates:
-                                            application/json: |
-                                                {
-                                                    "error": $context
-                                                }
                 components:
                     schemas:
                         event:
                             required:
                                 - event
+                                - recipient
                                 - timestamp
                             type: object
                             properties:
@@ -115,10 +105,19 @@ Resources:
                                         - rejected
                                         - unsubscribed
                                         - complained
+                                recipient:
+                                    type: string
+                                    example: "john@example.com"
+                                    pattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
                                 timestamp:
                                     type: string
                                     format: date-time
                                     example: "2023-01-01T23:00:00Z"
+                # request validator
+                x-amazon-apigateway-request-validators:
+                    basic:
+                        validateRequestParameters: false
+                        validateRequestBody: true
     # create api gateway stage
     AGWStage:
         Type: AWS::ApiGateway::Stage
