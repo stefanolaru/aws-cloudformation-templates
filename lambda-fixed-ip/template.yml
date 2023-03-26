@@ -228,8 +228,7 @@ Resources:
                               - ec2.amazonaws.com
                       Action: sts:AssumeRole
             ManagedPolicyArns:
-                - arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy # for cloudwatch agent
-                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore # for SSM
             Policies:
                 - PolicyName: !Sub ${AWS::StackName}-NATInstancePolicy
                   PolicyDocument:
