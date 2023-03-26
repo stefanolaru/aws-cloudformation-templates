@@ -276,18 +276,21 @@ Resources:
                                     data += chunk;
                                 });
                                 res.on('end', () => {
-                                    resolve(data);
+                                    resolve(JSON.parse(data));
                                 });
                             }).on("error", (err) => {
                                 reject(err);
                             });
                         });
-                        return response;
+                        return { elastic_ip: process.env.ELASTIC_IP, source_ip: response.ip };
                     };
             Handler: index.handler
             Role: !GetAtt NodeLambdaExecutionRole.Arn
             Runtime: nodejs18.x
             Timeout: 30
+            Environment:
+                Variables:
+                    ELASTIC_IP: !Ref ElasticIP
             # VPC configuration
             VpcConfig:
                 SecurityGroupIds:
