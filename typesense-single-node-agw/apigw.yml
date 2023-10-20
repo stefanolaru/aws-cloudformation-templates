@@ -1,0 +1,85 @@
+Description: APIGW-Typesense integration stack
+
+Parameters:
+    EnvironmentType:
+        Description: "Environment Type"
+        Type: String
+        Default: "dev"
+        AllowedValues:
+            - dev
+            - prod
+
+Mappings:
+    EnvironmentMap:
+        dev:
+            Uppercase: "DEV"
+        prod:
+            Uppercase: "PROD"
+
+Resources:
+    # API Gateway HTTP API
+    TypesenseApiGateway:
+        Type: AWS::ApiGatewayV2::Api
+        Properties:
+            Name: !Sub ${AWS::StackName}-HttpApi
+            ProtocolType: HTTP
+            CorsConfiguration:
+                AllowMethods:
+                    - GET
+                    - POST
+                    - OPTIONS
+                AllowHeaders:
+                    - Content-Type
+                    - X-Amz-Date
+                    - Authorization
+                    - X-Api-Key
+                    - X-Amz-Security-Token
+                    - X-Amz-User-Agent
+                AllowOrigins:
+                    - "*"
+                MaxAge: 86400
+    # API Gateway HTTP API for leads search
+    TypesenseSearchIntegration:
+        Type: AWS::ApiGatewayV2::Integration
+        Properties:
+            ApiId: !Ref TypesenseApiGateway
+            Description: Typesense Search Integration (HTTP GET)
+            IntegrationType: HTTP_PROXY
+            RequestParameters:
+                overwrite:path: "$request.path.proxy"
+            # needs to be reachable when deployed
+            IntegrationUri: !Sub
+                - "{{resolve:ssm:/${STAGE}/TYPESENSE_URL}}"
+                - STAGE:
+                      !FindInMap [
+                          EnvironmentMap,
+                          !Ref EnvironmentType,
+                          Uppercase,
+                      ]
+            IntegrationMethod: GET
+            PayloadFormatVersion: "1.0"
+
+    # API Gateway route
+    TypesenseSearchRoute:
+        Type: AWS::ApiGatewayV2::Route
+        Properties:
+            ApiId: !Ref TypesenseApiGateway
+            RouteKey: "GET /crm/{proxy+}"
+            Target: !Join
+                - /
+                - - integrations
+                  - !Ref TypesenseSearchIntegration
+
+Outputs:
+    HttpApiId:
+        Value: !Ref TypesenseApiGateway
+        Export:
+            Name: !Sub ${AWS::StackName}-api-id
+    TypesenseApiUrl:
+        Value: !Sub ${TypesenseApiGateway}.execute-api.${AWS::Region}.amazonaws.com
+        Export:
+            Name: !Sub ${AWS::StackName}-api-url
+    TypesenseSearchIntegration:
+        Value: !Ref TypesenseSearchIntegration
+        Export:
+            Name: !Sub ${AWS::StackName}-typesense-apig-integration

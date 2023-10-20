@@ -1,0 +1,412 @@
+Description: Typesense stack
+
+Parameters:
+    LatestLinuxAmiId:
+        Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+        Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64" # Amazon Linux 2023 (arm64)
+    EnvironmentType:
+        Description: "Environment Type"
+        Type: String
+        Default: "dev"
+        AllowedValues:
+            - dev
+            - prod
+    ParentStackName:
+        Description: "Parent Stack Name"
+        Type: String
+        Default: "apigw"
+    TypesenseVersion:
+        Description: "Typesense Version"
+        Type: String
+        Default: 0.25.1
+    TypesensePort:
+        Description: "Typesense Port"
+        Type: Number
+        Default: 8108
+    VolumeSize:
+        Description: "Storage Volume Size (GB)"
+        Type: Number
+        Default: 8
+    VolumeDevice:
+        Description: "Storage Volume Device"
+        Type: String
+        Default: "/dev/sdi"
+    VolumeMountPath:
+        Description: "Storage Volume Mount Path"
+        Type: String
+        Default: "/mnt/ebs"
+
+Mappings:
+    EnvironmentMap:
+        dev:
+            Uppercase: "DEV"
+        prod:
+            Uppercase: "PROD"
+
+Resources:
+    # EC2 Launch Template
+    LaunchTemplate:
+        Type: AWS::EC2::LaunchTemplate
+        Metadata:
+            AWS::CloudFormation::Init:
+                config:
+                    files:
+                        /var/lib/cloud/scripts/per-boot/typesense.sh:
+                            content: !Sub
+                                - |
+                                    #!/bin/bash
+
+                                    # get the instance public ip
+                                    EC2_INSTANCE_PUBLIC_IP=$(ec2-metadata -v | cut -d " " -f 2)
+
+                                    # get api id from stack output
+                                    API_ID=$(aws cloudformation describe-stacks \
+                                        --region ${AWS::Region} \
+                                        --stack-name ${ParentStackName} \
+                                        --query "Stacks[0].Outputs[?ExportName=='${ParentStackName}-api-id'].OutputValue" \
+                                        --output text)
+
+                                    # get the integration id from stack output
+                                    API_INTEGRATION_ID=$(aws cloudformation describe-stacks \
+                                        --region ${AWS::Region} \
+                                        --stack-name ${ParentStackName} \
+                                        --query "Stacks[0].Outputs[?ExportName=='${ParentStackName}-typesense-apig-integration'].OutputValue" \
+                                        --output text)
+
+                                    # update SSM parameter with instance public ip
+                                    aws ssm put-parameter \
+                                        --region ${AWS::Region} \
+                                        --name /${STAGE}/TYPESENSE_URL \
+                                        --value http://$EC2_INSTANCE_PUBLIC_IP:${TypesensePort} \
+                                        --type String \
+                                        --overwrite
+
+                                    # update api gateway integration uri with instance public ip
+                                    aws apigatewayv2 update-integration \
+                                        --region ${AWS::Region} \
+                                        --api-id $API_ID \
+                                        --integration-id $API_INTEGRATION_ID \
+                                        --integration-uri http://$EC2_INSTANCE_PUBLIC_IP:${TypesensePort}
+                                - STAGE:
+                                      !FindInMap [
+                                          EnvironmentMap,
+                                          !Ref EnvironmentType,
+                                          Uppercase,
+                                      ]
+        Properties:
+            LaunchTemplateName: !Sub ${AWS::StackName}_${EnvironmentType}_launch_template
+            LaunchTemplateData:
+                ImageId: !Ref LatestLinuxAmiId
+                InstanceType: t4g.small
+                IamInstanceProfile:
+                    Arn: !GetAtt EC2InstanceProfile.Arn
+                SecurityGroupIds:
+                    - !GetAtt EC2SecurityGroup.GroupId
+                UserData:
+                    Fn::Base64: !Sub
+                        - |
+                            #!/usr/bin/env bash
+
+                            # install cloudwatch agent
+                            yum -y install amazon-cloudwatch-agent
+
+                            # auto configure cloudwatch agent
+                            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${CloudWatchAgentConfig} -s
+
+                            # get instance-id
+                            EC2_INSTANCE_ID=$(ec2-metadata -i | cut -d " " -f 2)
+
+                            # attach volume
+                            aws ec2 attach-volume --device ${VolumeDevice} --instance-id $EC2_INSTANCE_ID --volume-id ${EBSVolume} --region ${AWS::Region}
+
+                            # wait for volume to be properly attached
+                            DATA_STATE="unknown"
+                            until [ "${!DATA_STATE}" == "attached" ]; do
+                                DATA_STATE=$(aws ec2 describe-volumes \
+                                    --region ${AWS::Region} \
+                                    --filters \
+                                        Name=attachment.instance-id,Values=${!EC2_INSTANCE_ID} \
+                                        Name=attachment.device,Values=${VolumeDevice} \
+                                    --query Volumes[].Attachments[].State \
+                                    --output text)
+
+                                sleep 5
+                            done
+
+                            # format the volume if doesn't have file system
+                            blkid --match-token TYPE=ext4 ${VolumeDevice} || mkfs.ext4 -m0 ${VolumeDevice}
+
+                            # create mount root folder
+                            mkdir -p ${VolumeMountPath}
+
+                            # mount the volume to folder
+                            mount ${VolumeDevice} ${VolumeMountPath}
+
+                            # persist the volume on restart
+                            echo "${VolumeDevice} ${VolumeMountPath} ext4 defaults,nofail 0 2" >> /etc/fstab
+
+                            # read typesense api key from SSM parameter
+                            TYPESENSE_API_KEY=$(aws ssm get-parameter \
+                                --region ${AWS::Region} \
+                                --name /${STAGE}/TYPESENSE_API_KEY \
+                                --query Parameter.Value \
+                                --with-decryption \
+                                --output text)
+
+                            # create typesense server config
+                            if [ ! -f ${VolumeMountPath}/typesense.ini ]
+                            then
+                                echo "[server]
+                            api-key = $TYPESENSE_API_KEY
+                            data-dir = ${VolumeMountPath}/data
+                            log-dir = ${VolumeMountPath}/log
+                            api-port = ${TypesensePort}" > ${VolumeMountPath}/typesense.ini
+                                chown ec2-user:ec2-user ${VolumeMountPath}/typesense.ini
+                            fi
+
+                            # create typesense data folder if not exists
+                            if [ ! -d ${VolumeMountPath}/data ]
+                            then
+                                mkdir -p ${VolumeMountPath}/data
+                                chown ec2-user:ec2-user ${VolumeMountPath}/data
+                            fi
+
+                            # create typesense logs folder if not exists
+                            if [ ! -d ${VolumeMountPath}/log ]
+                            then
+                                mkdir -p ${VolumeMountPath}/log
+                                chown ec2-user:ec2-user ${VolumeMountPath}/log
+                            fi
+
+                            # download & unarchive typesense
+                            curl -O https://dl.typesense.org/releases/${TypesenseVersion}/typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
+                            tar -xzf typesense-server-${TypesenseVersion}-linux-arm64.tar.gz -C /home/ec2-user
+                            # remove archive
+                            rm typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
+
+                            # create typesense service
+                            echo "[Unit]
+                            Description=Typesense service
+                            After=network.target
+
+                            [Service]
+                            Type=simple
+                            Restart=always
+                            RestartSec=5
+                            User=ec2-user
+                            ExecStart=/home/ec2-user/typesense-server --config=${VolumeMountPath}/typesense.ini
+
+                            [Install]
+                            WantedBy=default.target" > /etc/systemd/system/typesense.service
+
+                            # start typesense service
+                            systemctl start typesense
+                            # enable typesense daemon
+                            systemctl enable typesense
+
+                            # run cfn init
+                            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
+                            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+                            # run typesense.sh (per-boot)
+                            bash /var/lib/cloud/scripts/per-boot/typesense.sh
+                        - STAGE:
+                              !FindInMap [
+                                  EnvironmentMap,
+                                  !Ref EnvironmentType,
+                                  Uppercase,
+                              ]
+
+    # ASG
+    AutoScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            LaunchTemplate:
+                LaunchTemplateId: !Ref LaunchTemplate
+                Version: !GetAtt LaunchTemplate.LatestVersionNumber
+            DesiredCapacity: 1
+            MinSize: 0
+            MaxSize: 1
+            AvailabilityZones:
+                - !Select [0, !GetAZs ""]
+            Tags:
+                - Key: Name
+                  PropagateAtLaunch: true
+                  Value: !Sub ${AWS::StackName}-${EnvironmentType}
+
+    # Instance profile
+    EC2InstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            InstanceProfileName: !Sub ${AWS::StackName}_${EnvironmentType}_ec2_profile
+            Path: /
+            Roles:
+                - !Ref EC2InstanceRole
+
+    # Instance Role
+    EC2InstanceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${AWS::StackName}_${EnvironmentType}_ec2_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Path: /
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+                - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_${EnvironmentType}_ec2_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # allow attaching EBS volumes
+                          - Effect: Allow
+                            Action:
+                                - ec2:AttachVolume
+                                - ec2:DetachVolume
+                                - ec2:DescribeVolumes
+                            Resource: "*"
+                          # allow SSM Parameter reading
+                          - Effect: Allow
+                            Action:
+                                - ssm:GetParameter
+                            Resource:
+                                - !Join
+                                  - ""
+                                  - - "arn:aws:ssm:"
+                                    - !Ref AWS::Region
+                                    - ":"
+                                    - !Ref AWS::AccountId
+                                    - ":parameter/"
+                                    - !FindInMap [
+                                          EnvironmentMap,
+                                          !Ref EnvironmentType,
+                                          Uppercase,
+                                      ]
+                                    - "/TYPESENSE_API_KEY"
+                                - !Join
+                                  - ""
+                                  - - "arn:aws:ssm:"
+                                    - !Ref AWS::Region
+                                    - ":"
+                                    - !Ref AWS::AccountId
+                                    - ":parameter/TYPESENSE_CLOUDWATCH_AGENT_CONFIG"
+
+                          # allow write SSM Parameter
+                          - Effect: Allow
+                            Action:
+                                - ssm:PutParameter
+                            # only params that are /${EnvironmentMap}/TYPESENSE_URL
+                            Resource: !Join
+                                - ""
+                                - - "arn:aws:ssm:"
+                                  - !Ref AWS::Region
+                                  - ":"
+                                  - !Ref AWS::AccountId
+                                  - ":parameter/"
+                                  - !FindInMap [
+                                        EnvironmentMap,
+                                        !Ref EnvironmentType,
+                                        Uppercase,
+                                    ]
+                                  - "/TYPESENSE_URL"
+                          # allow update api gateway integration
+                          - Effect: Allow
+                            Action:
+                                - apigateway:PATCH
+                            Resource: !Join
+                                - ""
+                                - - "arn:aws:apigateway:"
+                                  - !Ref AWS::Region
+                                  - "::/apis/"
+                                  - !ImportValue
+                                    Fn::Sub: ${ParentStackName}-api-id
+                                  - "/integrations/"
+                                  - !ImportValue
+                                    Fn::Sub: ${ParentStackName}-typesense-apig-integration
+                          # allow describe stacks
+                          - Effect: Allow
+                            Action:
+                                - cloudformation:DescribeStacks
+                            Resource:
+                                - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+    # EBS Volume
+    EBSVolume:
+        Type: AWS::EC2::Volume
+        Properties:
+            Size: !Ref VolumeSize
+            VolumeType: gp3
+            AvailabilityZone: !Select [0, !GetAZs ""]
+        DeletionPolicy: Snapshot
+
+    # Instance Security Group
+    EC2SecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: allow connections on HTTP
+            SecurityGroupIngress:
+                # Allow HTTP traffic on Typesense port
+                - IpProtocol: tcp
+                  FromPort: !Ref TypesensePort
+                  ToPort: !Ref TypesensePort
+                  CidrIp: 0.0.0.0/0
+
+    # SSM CloudWatch agent config
+    CloudWatchAgentConfig:
+        Type: AWS::SSM::Parameter
+        Properties:
+            Name: AmazonCloudWatchConfig
+            Type: String
+            Value: |
+                {
+                    "agent": {
+                        "metrics_collection_interval": 60,
+                        "run_as_user": "root"
+                    },
+                    "logs": {
+                        "logs_collected": {
+                            "files": {
+                                "collect_list": [
+                                    {
+                                        "file_path": "/opt/typesense/log/typesense.log",
+                                        "log_group_name": "typesense.log",
+                                        "log_stream_name": "{instance_id}",
+                                        "retention_in_days": 7
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "metrics": {
+                        "aggregation_dimensions": [["InstanceId"]],
+                        "append_dimensions": {
+                            "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+                            "ImageId": "${aws:ImageId}",
+                            "InstanceId": "${aws:InstanceId}",
+                            "InstanceType": "${aws:InstanceType}"
+                        },
+                        "metrics_collected": {
+                            "disk": {
+                                "measurement": ["used_percent"],
+                                "metrics_collection_interval": 60,
+                                "resources": ["*"]
+                            },
+                            "mem": {
+                                "measurement": ["mem_used_percent"],
+                                "metrics_collection_interval": 60
+                            },
+                            "statsd": {
+                                "metrics_aggregation_interval": 60,
+                                "metrics_collection_interval": 10,
+                                "service_address": ":8125"
+                            }
+                        }
+                    }
+                }
