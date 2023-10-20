@@ -15,6 +15,18 @@ Parameters:
         Description: "Parent Stack Name"
         Type: String
         Default: "apigw"
+    InstanceType:
+        Description: "Instance Size"
+        Type: String
+        Default: t4g.micro
+        AllowedValues:
+            - t4g.nano
+            - t4g.micro
+            - t4g.small
+            - t4g.medium
+            - t4g.large
+            - t4g.xlarge
+            - t4g.2xlarge
     TypesenseVersion:
         Description: "Typesense Version"
         Type: String
@@ -117,7 +129,7 @@ Resources:
             LaunchTemplateName: !Sub ${AWS::StackName}_${EnvironmentType}_launch_template
             LaunchTemplateData:
                 ImageId: !Ref LatestLinuxAmiId
-                InstanceType: t4g.small
+                InstanceType: !Ref InstanceType
                 IamInstanceProfile:
                     Arn: !GetAtt EC2InstanceProfile.Arn
                 SecurityGroupIds:
