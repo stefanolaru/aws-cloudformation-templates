@@ -64,11 +64,19 @@ Resources:
         Type: AWS::ApiGatewayV2::Route
         Properties:
             ApiId: !Ref TypesenseApiGateway
-            RouteKey: "GET /crm/{proxy+}"
+            RouteKey: "GET /{proxy+}"
             Target: !Join
                 - /
                 - - integrations
                   - !Ref TypesenseSearchIntegration
+
+    # Create a $default stage
+    TypesenseApiGatewayStage:
+        Type: AWS::ApiGatewayV2::Stage
+        Properties:
+            ApiId: !Ref TypesenseApiGateway
+            StageName: $default
+            AutoDeploy: true
 
 Outputs:
     HttpApiId:
