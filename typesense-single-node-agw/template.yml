@@ -50,7 +50,11 @@ Resources:
         Metadata:
             AWS::CloudFormation::Init:
                 config:
+                    packages:
+                        yum:
+                            amazon-cloudwatch-agent: []
                     files:
+                        # typesense.sh (per-boot)
                         /var/lib/cloud/scripts/per-boot/typesense.sh:
                             content: !Sub
                                 - |
@@ -93,6 +97,22 @@ Resources:
                                           !Ref EnvironmentType,
                                           Uppercase,
                                       ]
+                        # typesense service
+                        /etc/systemd/system/typesense.service:
+                            content: !Sub |
+                                [Unit]
+                                Description=Typesense service
+                                After=network.target
+
+                                [Service]
+                                Type=simple
+                                Restart=always
+                                RestartSec=5
+                                User=ec2-user
+                                ExecStart=/home/ec2-user/typesense-server --config=${VolumeMountPath}/typesense.ini
+
+                                [Install]
+                                WantedBy=default.target
         Properties:
             LaunchTemplateName: !Sub ${AWS::StackName}_${EnvironmentType}_launch_template
             LaunchTemplateData:
@@ -106,12 +126,6 @@ Resources:
                     Fn::Base64: !Sub
                         - |
                             #!/usr/bin/env bash
-
-                            # install cloudwatch agent
-                            yum -y install amazon-cloudwatch-agent
-
-                            # auto configure cloudwatch agent
-                            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${CloudWatchAgentConfig} -s
 
                             # get instance-id
                             EC2_INSTANCE_ID=$(ec2-metadata -i | cut -d " " -f 2)
@@ -184,32 +198,21 @@ Resources:
                             # remove archive
                             rm typesense-server-${TypesenseVersion}-linux-arm64.tar.gz
 
-                            # create typesense service
-                            echo "[Unit]
-                            Description=Typesense service
-                            After=network.target
+                            # run cfn init
+                            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
+                            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
 
-                            [Service]
-                            Type=simple
-                            Restart=always
-                            RestartSec=5
-                            User=ec2-user
-                            ExecStart=/home/ec2-user/typesense-server --config=${VolumeMountPath}/typesense.ini
+                            # auto configure cloudwatch agent
+                            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${CloudWatchAgentConfig} -s
 
-                            [Install]
-                            WantedBy=default.target" > /etc/systemd/system/typesense.service
+                            # run typesense.sh (per-boot)
+                            bash /var/lib/cloud/scripts/per-boot/typesense.sh
 
                             # start typesense service
                             systemctl start typesense
                             # enable typesense daemon
                             systemctl enable typesense
 
-                            # run cfn init
-                            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region}
-                            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
-
-                            # run typesense.sh (per-boot)
-                            bash /var/lib/cloud/scripts/per-boot/typesense.sh
                         - STAGE:
                               !FindInMap [
                                   EnvironmentMap,
