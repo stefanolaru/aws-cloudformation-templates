@@ -110,6 +110,7 @@ Resources:
                                           Uppercase,
                                       ]
                             mode: "000744"
+
                         # typesense service
                         /etc/systemd/system/typesense.service:
                             content: !Sub |
@@ -139,26 +140,6 @@ Resources:
                     Fn::Base64: !Sub
                         - |
                             #!/usr/bin/env bash
-
-                            # get instance-id
-                            EC2_INSTANCE_ID=$(ec2-metadata -i | cut -d " " -f 2)
-
-                            # attach volume
-                            aws ec2 attach-volume --device ${VolumeDevice} --instance-id $EC2_INSTANCE_ID --volume-id ${EBSVolume} --region ${AWS::Region}
-
-                            # wait for volume to be properly attached
-                            DATA_STATE="unknown"
-                            until [ "${!DATA_STATE}" == "attached" ]; do
-                                DATA_STATE=$(aws ec2 describe-volumes \
-                                    --region ${AWS::Region} \
-                                    --filters \
-                                        Name=attachment.instance-id,Values=${!EC2_INSTANCE_ID} \
-                                        Name=attachment.device,Values=${VolumeDevice} \
-                                    --query Volumes[].Attachments[].State \
-                                    --output text)
-
-                                sleep 5
-                            done
 
                             # format the volume if doesn't have file system
                             blkid --match-token TYPE=ext4 ${VolumeDevice} || mkfs.ext4 -m0 ${VolumeDevice}
@@ -233,23 +214,27 @@ Resources:
                                   Uppercase,
                               ]
 
-    # ASG
-    AutoScalingGroup:
-        Type: AWS::AutoScaling::AutoScalingGroup
+    # EC2 instance
+    EC2Instance:
+        Type: AWS::EC2::Instance
         Properties:
             LaunchTemplate:
                 LaunchTemplateId: !Ref LaunchTemplate
                 Version: !GetAtt LaunchTemplate.LatestVersionNumber
-            DesiredCapacity: 1
-            MinSize: 0
-            MaxSize: 1
-            AvailabilityZones:
-                - !Select [0, !GetAZs ""]
+            BlockDeviceMappings:
+                - DeviceName: !Ref VolumeDevice
+                  Ebs:
+                      VolumeSize: !Ref VolumeSize
+                      VolumeType: gp3
+                      DeleteOnTermination: true
             Tags:
                 - Key: Name
-                  PropagateAtLaunch: true
                   Value: !Sub ${AWS::StackName}-${EnvironmentType}
-
+        DependsOn:
+            - EC2InstanceProfile
+            - EC2InstanceRole
+            - EC2SecurityGroup
+            - LaunchTemplate
     # Instance profile
     EC2InstanceProfile:
         Type: AWS::IAM::InstanceProfile
@@ -282,13 +267,6 @@ Resources:
                   PolicyDocument:
                       Version: "2012-10-17"
                       Statement:
-                          # allow attaching EBS volumes
-                          - Effect: Allow
-                            Action:
-                                - ec2:AttachVolume
-                                - ec2:DetachVolume
-                                - ec2:DescribeVolumes
-                            Resource: "*"
                           # allow SSM Parameter reading
                           - Effect: Allow
                             Action:
@@ -353,14 +331,6 @@ Resources:
                                 - cloudformation:DescribeStacks
                             Resource:
                                 - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
-    # EBS Volume
-    EBSVolume:
-        Type: AWS::EC2::Volume
-        Properties:
-            Size: !Ref VolumeSize
-            VolumeType: gp3
-            AvailabilityZone: !Select [0, !GetAZs ""]
-        DeletionPolicy: Snapshot
 
     # Instance Security Group
     EC2SecurityGroup:
