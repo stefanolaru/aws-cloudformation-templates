@@ -1,0 +1,504 @@
+Description: StepFunctions RDS Snapshot > S3 > Glue > Athena
+Parameters:
+    RDSDBIdentifier:
+        Description: RDS DB Identifier
+        Type: String
+
+Resources:
+    # IAM Role allowing the step functio to do its job
+    StepFunctionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}_step_function_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_step_function_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # needed by the step function
+                          - Effect: Allow
+                            Action:
+                                - rds:StartExportTask
+                                - rds:DescribeDBSnapshots
+                            Resource: "*"
+                          # pass role to export snapshot role
+                          - Effect: Allow
+                            Action:
+                                - iam:PassRole
+                            Resource: !GetAtt ExportSnapshotRole.Arn
+                          # allow s3 put object for task token
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}/export_task_token
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}/glue_task_token
+                          # allow glue crawler
+                          - Effect: Allow
+                            Action:
+                                - glue:StartCrawler
+                            Resource: "*"
+                          # allow lambda invoke
+                          - Effect: Allow
+                            Action:
+                                - lambda:InvokeFunction
+                            Resource: !Join
+                                - ""
+                                - - !GetAtt MoveExportsLambda.Arn
+                                  - ":*" # allow invoke any version
+
+    # the step function
+    StateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${AWS::StackName}
+            RoleArn: !GetAtt StepFunctionRole.Arn
+            DefinitionSubstitutions:
+                S3Bucket: !Ref SnapshotExportBucket
+                ExportRoleArn: !GetAtt ExportSnapshotRole.Arn
+                KmsKeyId: !Ref KMSKey
+                MoveExportsLambda: !GetAtt MoveExportsLambda.Arn
+                GlueCrawler: !Ref GlueCrawler
+            DefinitionString: |
+                {
+                    "Comment": "Export RDS Snapshot to S3 and start Glue Crawler",
+                    "StartAt": "StartExportTask",
+                    "States": {
+                        "StartExportTask": {
+                            "Type": "Task",
+                            "Next": "Wait for Export (TT)",
+                            "Parameters": {
+                                "ExportTaskIdentifier.$": "States.ArrayGetItem(States.StringSplit($.detail.SourceIdentifier, ':'),1)",
+                                "IamRoleArn": "${ExportRoleArn}",
+                                "KmsKeyId": "${KmsKeyId}",
+                                "S3BucketName": "${S3Bucket}",
+                                "SourceArn.$": "$.detail.SourceArn"
+                            },
+                            "Resource": "arn:aws:states:::aws-sdk:rds:startExportTask"
+                        },
+                        "Wait for Export (TT)": {
+                            "Type": "Task",
+                            "Next": "Move Exported Objects",
+                            "Parameters": {
+                                "Body.$": "$$.Task.Token",
+                                "Bucket": "${S3Bucket}",
+                                "Key": "export_task_token"
+                            },
+                            "Resource": "arn:aws:states:::aws-sdk:s3:putObject.waitForTaskToken",
+                            "HeartbeatSeconds": 3600,
+                            "ResultPath": null
+                        },
+                        "Move Exported Objects": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${MoveExportsLambda}:$LATEST",
+                                "Payload": {
+                                    "prefix.$": "$.ExportTaskIdentifier"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 1,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "Next": "Start Glue Crawler"
+                        },
+                        "Start Glue Crawler": {
+                            "Type": "Task",
+                            "Next": "Wait for Crawler (TT)",
+                            "Parameters": {
+                                "Name": "${GlueCrawler}"
+                            },
+                            "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler"
+                        },
+                        "Wait for Crawler (TT)": {
+                            "Type": "Task",
+                            "Next": "Success",
+                            "Parameters": {
+                                "Body.$": "$$.Task.Token",
+                                "Bucket": "${S3Bucket}",
+                                "Key": "glue_task_token"
+                            },
+                            "Resource": "arn:aws:states:::aws-sdk:s3:putObject.waitForTaskToken",
+                            "HeartbeatSeconds": 3600
+                        },
+                        "Success": {
+                            "Type": "Succeed"
+                        }
+                    }
+                }
+
+    # IAM Role for the export snapshot task
+    ExportSnapshotRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}_export_snapshot_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - export.rds.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_export_snapshot_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject*
+                                - s3:ListBucket
+                                - s3:GetObject*
+                                - s3:DeleteObject*
+                                - s3:GetBucketLocation
+                            Resource:
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}/*
+
+    # S3 bucket - export destination
+    SnapshotExportBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub ${AWS::StackName}-snapshot-export-bucket
+            AccessControl: Private
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+
+    # KMS key for the snapshot export
+    KMSKey:
+        Type: AWS::KMS::Key
+        Properties:
+            Description: KMS key for the snapshot export
+            KeyPolicy:
+                Version: "2012-10-17"
+                Id: !Sub ${AWS::StackName}-kms-key
+                Statement:
+                    # allow root to update key policy
+                    - Sid: Enable IAM User Permissions
+                      Effect: Allow
+                      Principal:
+                          AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+                      Action: kms:*
+                      Resource: "*"
+                    # enable use by export role
+                    - Sid: Allow use by the RDS export role
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt ExportSnapshotRole.Arn
+                      Action: kms:*
+                      Resource: "*"
+                    # enable use by step function role
+                    - Sid: Allow use by the step function role
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt StepFunctionRole.Arn
+                      Action: kms:*
+                      Resource: "*"
+                    # enable use by glue role
+                    - Sid: Allow use by the glue role
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt GlueRole.Arn
+                      Action: kms:*
+                      Resource: "*"
+                    # allow lambda to use the key
+                    - Sid: Allow use by lambda
+                      Effect: Allow
+                      Principal:
+                          AWS: !GetAtt LambdaRole.Arn
+                      Action: kms:*
+                      Resource: "*"
+
+    # IAM Role for the lambda functions (task token and move exports)
+    LambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}_lambda_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_lambda_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # needed by the step function
+                          - Effect: Allow
+                            Action:
+                                - states:SendTaskSuccess
+                            Resource: "*"
+                          # allow read S3 object manipulation
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                                - s3:ListBucket
+                                - s3:DeleteObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}/*
+
+    # Lambda function to send task token back to the step function
+    TaskTokenLambda:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${AWS::StackName}_task_token
+            Description: Send task token to step function
+            Handler: index.handler
+            Role: !GetAtt LambdaRole.Arn
+            Runtime: nodejs18.x
+            Timeout: 15
+            Environment:
+                Variables:
+                    S3_BUCKET: !Ref SnapshotExportBucket
+            Code:
+                ZipFile: |
+                    const { SFNClient, SendTaskSuccessCommand } = require('@aws-sdk/client-sfn'), { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+                    const sf = new SFNClient(), s3 = new S3Client();
+                    exports.handler = async (event) => {
+                        // get the task token from s3
+                        const taskToken = await s3.send(new GetObjectCommand({
+                            Bucket: process.env.S3_BUCKET,
+                            Key: event.source === 'aws.glue' ? 'glue_task_token' : 'export_task_token'
+                        })).then(data => data.Body.transformToString("utf-8")).catch(err => {
+                            console.log(err);
+                            return null;
+                        });
+                        // send the task token to step function
+                        await sf.send(new SendTaskSuccessCommand({
+                            output: JSON.stringify(event),
+                            taskToken: taskToken
+                        }));
+                        return;
+                    };
+
+    # Lambda function to list bucket and copy the exported files (with folder prefix) to the data folder
+    MoveExportsLambda:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${AWS::StackName}_move_exported_files
+            Description: Move exported files to the data folder
+            Handler: index.handler
+            Role: !GetAtt LambdaRole.Arn
+            Runtime: nodejs18.x
+            Timeout: 300
+            MemorySize: 256
+            Environment:
+                Variables:
+                    S3_BUCKET: !Ref SnapshotExportBucket
+            Code:
+                ZipFile: |
+                    const { S3Client, ListObjectsV2Command, CopyObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+                    const s3 = new S3Client();
+                    exports.handler = async (event) => {
+                        // list the objects in the bucket
+                        const objects = await s3.send(new ListObjectsV2Command({
+                            Bucket: process.env.S3_BUCKET,
+                            Prefix: event.prefix
+                        })).then(data => data.Contents).catch(err => {
+                            console.log(err);
+                            return null;
+                        });
+                        // copy the objects to the data folder
+                        for (const object of objects) {
+                            await s3.send(new CopyObjectCommand({
+                                Bucket: process.env.S3_BUCKET,
+                                CopySource: `${process.env.S3_BUCKET}/${object.Key}`,
+                                Key: `data/${object.Key.split('/').slice(1).join('/')}`
+                            })).then(() => {
+                                // delete the old object
+                                s3.send(new DeleteObjectCommand({
+                                    Bucket: process.env.S3_BUCKET,
+                                    Key: object.Key
+                                }));
+                            })
+                            .catch(err => {
+                                console.log(err);
+                                return null;
+                            });
+                        }
+                    }
+
+    # EventBridge rule to trigger step function when an automated snapshot is created
+    EventBridgeSnapshotCreatedRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Description: EventBridge rule to trigger step function when an automated rds snapshot is created
+            EventPattern:
+                source:
+                    - aws.rds
+                detail-type:
+                    - RDS DB Snapshot Event
+                detail:
+                    SourceIdentifier:
+                        - prefix: !Sub rds:${RDSDBIdentifier}
+                    Message:
+                        - prefix: Automated snapshot created
+            Targets:
+                # step function
+                - Arn: !GetAtt StateMachine.Arn
+                  Id: !Sub ${AWS::StackName}_step_function
+                  RoleArn: !GetAtt EventBridgeStepFunctionRole.Arn
+
+    # IAM Role allowing EventBridge to start execution of the step function when an automated snapshot is created
+    EventBridgeStepFunctionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}_eventbridge_step_function_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - events.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_eventbridge_step_function_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - states:StartExecution
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    # EventBridge rule to trigger task token lambda when the export task is completed
+    EventBridgeStartExportRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Description: EventBridge rule to trigger task token lambda when the export task is completed
+            EventPattern:
+                source:
+                    - aws.rds
+                detail-type:
+                    - RDS DB Snapshot Export
+                detail:
+                    SourceIdentifier:
+                        - prefix: !Sub rds:${RDSDBIdentifier}
+                    Status:
+                        - completed
+            Targets:
+                - Arn: !GetAtt TaskTokenLambda.Arn
+                  Id: !Sub ${AWS::StackName}_task_token_lambda
+
+    # allow EventBridge to invoke the task token Lambda
+    EventBridgeExportRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !GetAtt TaskTokenLambda.Arn
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt EventBridgeStartExportRule.Arn
+
+    # EventBridge rule to trigger when the glue crawler is completed
+    EventBridgeCrawlCompletedRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Description: Trigger TaskToken Lambda when the Crawl is completed
+            EventPattern:
+                source:
+                    - aws.glue
+                detail-type:
+                    - Glue Crawler State Change
+                detail:
+                    crawlerName:
+                        - !Sub ${AWS::StackName}_crawler
+                    state:
+                        - Succeeded
+            Targets:
+                - Arn: !GetAtt TaskTokenLambda.Arn
+                  Id: !Sub ${AWS::StackName}_task_token_lambda
+
+    # allow EventBridge to invoke the task token lambda
+    EventBridgeCrawlCompletedRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !GetAtt TaskTokenLambda.Arn
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt EventBridgeCrawlCompletedRule.Arn
+
+    # IAM Role for glue allowing Glue crawler to do its job
+    GlueRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${AWS::StackName}_glue_role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - glue.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+            Policies:
+                - PolicyName: !Sub ${AWS::StackName}_glue_policy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # needed by the step function
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${SnapshotExportBucket}/data/*
+
+    # The Glue database
+    GlueDatabase:
+        Type: AWS::Glue::Database
+        Properties:
+            CatalogId: !Ref AWS::AccountId
+            DatabaseInput:
+                Name: !Sub ${AWS::StackName}
+                Description: !Sub ${AWS::StackName} database
+
+    # The Glue crawler
+    GlueCrawler:
+        Type: AWS::Glue::Crawler
+        Properties:
+            DatabaseName: !Ref GlueDatabase
+            Role: !GetAtt GlueRole.Arn
+            Targets:
+                S3Targets:
+                    - Path: !Sub s3://${SnapshotExportBucket}/data/
+            Name: !Sub ${AWS::StackName}_crawler
+            Description: !Sub ${AWS::StackName} crawler
