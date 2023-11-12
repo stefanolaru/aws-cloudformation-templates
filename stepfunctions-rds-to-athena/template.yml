@@ -289,6 +289,7 @@ Resources:
                     const { SFNClient, SendTaskSuccessCommand } = require('@aws-sdk/client-sfn'), { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
                     const sf = new SFNClient(), s3 = new S3Client();
                     exports.handler = async (event) => {
+                        console.log(event);
                         // get the task token from s3
                         const taskToken = await s3.send(new GetObjectCommand({
                             Bucket: process.env.S3_BUCKET,
@@ -406,12 +407,12 @@ Resources:
                 source:
                     - aws.rds
                 detail-type:
-                    - RDS DB Snapshot Export
+                    - RDS DB Snapshot Event
                 detail:
                     SourceIdentifier:
                         - prefix: !Sub rds:${RDSDBIdentifier}
-                    Status:
-                        - completed
+                    Message:
+                        - prefix: The snapshot export task completed
             Targets:
                 - Arn: !GetAtt TaskTokenLambda.Arn
                   Id: !Sub ${AWS::StackName}_task_token_lambda
