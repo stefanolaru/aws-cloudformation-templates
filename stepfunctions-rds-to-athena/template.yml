@@ -399,7 +399,7 @@ Resources:
                             Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
 
     # EventBridge rule to trigger task token lambda when the export task is completed
-    EventBridgeStartExportRule:
+    EventBridgeExportCompletedRule:
         Type: AWS::Events::Rule
         Properties:
             Description: EventBridge rule to trigger task token lambda when the export task is completed
@@ -412,7 +412,7 @@ Resources:
                     SourceIdentifier:
                         - prefix: ${RDSDBIdentifier}
                     Message:
-                        - prefix: The snapshot export task completed
+                        - prefix: Export task completed
             Targets:
                 - Arn: !GetAtt TaskTokenLambda.Arn
                   Id: !Sub ${AWS::StackName}_task_token_lambda
@@ -424,7 +424,7 @@ Resources:
             Action: lambda:InvokeFunction
             FunctionName: !GetAtt TaskTokenLambda.Arn
             Principal: events.amazonaws.com
-            SourceArn: !GetAtt EventBridgeStartExportRule.Arn
+            SourceArn: !GetAtt EventBridgeExportCompletedRule.Arn
 
     # EventBridge rule to trigger when the glue crawler is completed
     EventBridgeCrawlCompletedRule:
