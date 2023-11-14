@@ -410,7 +410,7 @@ Resources:
                     - RDS DB Snapshot Event
                 detail:
                     SourceIdentifier:
-                        - prefix: ${RDSDBIdentifier}
+                        - prefix: rds:${RDSDBIdentifier}
                     Message:
                         - prefix: Export task completed
             Targets:
