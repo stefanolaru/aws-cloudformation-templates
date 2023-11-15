@@ -132,17 +132,14 @@ Resources:
                         },
                         "Wait for Crawler (TT)": {
                             "Type": "Task",
-                            "Next": "Success",
                             "Parameters": {
                                 "Body.$": "$$.Task.Token",
                                 "Bucket": "${S3Bucket}",
                                 "Key": "glue_task_token"
                             },
                             "Resource": "arn:aws:states:::aws-sdk:s3:putObject.waitForTaskToken",
-                            "HeartbeatSeconds": 3600
-                        },
-                        "Success": {
-                            "Type": "Succeed"
+                            "HeartbeatSeconds": 3600,
+                            "End": true
                         }
                     }
                 }
@@ -410,7 +407,7 @@ Resources:
                     - RDS DB Snapshot Event
                 detail:
                     SourceIdentifier:
-                        - prefix: rds:${RDSDBIdentifier}
+                        - prefix: !Sub rds:${RDSDBIdentifier}
                     Message:
                         - prefix: Export task completed
             Targets:
