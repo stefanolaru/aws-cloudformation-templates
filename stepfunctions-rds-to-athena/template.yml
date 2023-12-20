@@ -3,6 +3,10 @@ Parameters:
     RDSDBIdentifier:
         Description: RDS DB Identifier
         Type: String
+    S3BucketName:
+        Description: S3 Bucket Name
+        Default: !Sub ${AWS::StackName}-snapshot-export-bucket
+        Type: String
 
 Resources:
     # IAM Role allowing the step functio to do its job
@@ -178,7 +182,7 @@ Resources:
     SnapshotExportBucket:
         Type: AWS::S3::Bucket
         Properties:
-            BucketName: !Sub ${AWS::StackName}-snapshot-export-bucket
+            BucketName: !Ref S3BucketName
             AccessControl: Private
             PublicAccessBlockConfiguration:
                 BlockPublicAcls: true
