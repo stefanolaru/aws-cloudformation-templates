@@ -34,15 +34,15 @@ exports.handler = async () => {
         .promise()
         .then((res) => {
             res.Reservations.forEach((v) => {
-                if (v.Instances[0]) {
+                v.Instances.forEach((i) => {
                     nodeStrings.push(
-                        v.Instances[0].PrivateIpAddress +
+                        i.PrivateIpAddress +
                             ":" +
                             process.env.TypesensePeeringPort +
                             ":" +
                             process.env.TypesenseApiPort
                     );
-                }
+                });
             });
         })
         .catch((err) => {
